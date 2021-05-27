@@ -1,0 +1,15 @@
+        INTRO
+    Simultaneus Localization And Mapping 
+more of a concept than an algo. 
+the idea is to build a map of the environment and move through the environment using that map all while continously updating the map. 
+
+SLAM can be broken down into a few parts: 
+        Landmark extraction 
+        data association 
+        state estimation 
+        state update
+        landmark update 
+
+'odometry performance' measures how well the bot can estimate its position. Error should be less than 2cm per meter and 2deg per 45deg. 
+
+Step 1 - Write algo to detect landmarks
