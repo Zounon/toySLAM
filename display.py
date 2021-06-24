@@ -2,18 +2,16 @@ import cv2 as cv
 import numpy as np
 import pygame 
 from pygame.locals import DOUBLEBUF
-import sdl2
-import sdl2.ext
 
-class Display(object): 
-    def __init__(self, Width, Height): 
-        """
-        create
-        """
-        sdl2.ext.init()
-        self.W, self.H = Width, Height
-        self.window = sdl2.ext.Window("mySlam", size=(W,H))
-        self.window.show()
+# class Display(object): 
+#     def __init__(self, Width, Height): 
+#         """
+#         create
+#         """
+#         sdl2.ext.init()
+#         self.W, self.H = Width, Height
+#         self.window = sdl2.ext.Window("mySlam", size=(W,H))
+#         self.window.show()
 
 
 class Display2D(object):    

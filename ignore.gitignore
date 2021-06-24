@@ -1,5 +1,7 @@
-__pycache__
-.vscode
+__pycache__/
+.vscode/
 g2opy/
 pangolin/ 
+g20py/
+orbslam2_features/ 
 *.pdf
