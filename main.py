@@ -5,10 +5,10 @@ import cv2 as cv
 from collections import defaultdict
 from skimage.measure import ransac
 from skimage.transform import EssentialMatrixTransform, FundamentalMatrixTransform
-from display import Display2D
+from display import Display2D, Display3D
 from matplotlib import pyplot as plt
 
-from not_my_functions import extractRt, add_ones, normalize, denormalize
+from not_my_functions import extractRt, add_ones, normalize, denormalize, fundamentalToRt
 
 orb = cv.ORB_create()
 class Map(object):
@@ -128,7 +128,7 @@ class FeatureMatcher(object):
         # ignore outliers ????????????????
         Rt = extractRt(model.params)
 
-        return idx1[inliers], idx2[inliers], Rt
+        return idx1[inliers], idx2[inliers], fundamentalToRt(model.params)
 
     def match_des(self, des1, des2): 
         self.matches = self.matcher.knnMatch(des1, des2, k=2)
@@ -196,7 +196,7 @@ class Frame(object):
         self.img_grey = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
         self.id = len(slam.frames) 
         IRt = np.eye(4)
-        self.pose = IRt
+        self.pose = np.array(IRt)
         # print('new frame w/ id:', self.id)
 
 class Point(object): 
@@ -280,15 +280,19 @@ class SLAM(object):
         # TODO? Make idx1, idx2, Rt an antribute of each Frame? 
         idx1, idx2, Rt = self.fm.filter_matches(last_frame, curr_frame)
         # print(Rt)
+
         curr_frame.pose = np.dot(Rt, last_frame.pose)
+
         # print(last_frame.pose)
         # print(curr_frame.pose)
         # print(len(last_frame.pts[idx2]))
         # print(len(curr_frame.pts[idx1]))
-        pts4d = self.triangulate(last_frame.pose, curr_frame.pose, last_frame.pts[idx2], curr_frame.pts[idx1])
+
+        # pts4d = self.triangulate(last_frame.pose, curr_frame.pose, last_frame.pts[idx2], curr_frame.pts[idx1])
+
         # annotate the frame with filtered match results 
-        self.annotate_frame(last_frame, curr_frame, idx1, idx2)
-        
+        curr_frame.img = self.annotate_frame(last_frame, curr_frame, idx1, idx2)
+           
             
         # OLD: self.curr_frame.process_next_frame(self.last_frame, self.curr_frame)
 
@@ -296,9 +300,12 @@ class SLAM(object):
         annotated_img = self.curr_frame.img_rgb.copy()
 
         if last_frame == None:
-            annotated_img = cv.drawKeypoints(annotated_img, curr_frame.kps, annotated_img)
             disp2d.paint(annotated_img)
-            return
+            # annotated_img = cv.drawKeypoints(annotated_img, curr_frame.kps, annotated_img)
+            for pt1 in curr_frame.pts:
+                u1, v1 = int(round(pt1[0])), int(round(pt1[1]))
+                cv.circle(annotated_img, (u1, v1), color=(255, 0, 0), radius=3)
+            return 
 
         for pt2, pt1 in zip(last_frame.pts[idx2], curr_frame.pts[idx1]):
             #u1, v1 = denormalize(self.K, pt1)
@@ -308,9 +315,11 @@ class SLAM(object):
             # print(u1,v1)
             cv.circle(annotated_img, (u1,v1), color=(0, 255, 0), radius=3)
             cv.line(annotated_img, (u1,v1), (u2, v2), (0, 255, 255), 1)
-        # print('num pts: ', len(curr_frame.pts))
+
         disp2d.paint(annotated_img)
-    
+        return annotated_img
+        # print('num pts: ', len(curr_frame.pts))
+
     # def process_first_frame(self, curr_frame): 
     #     curr_frame.kps, curr_frame.des = orb.detectAndCompute(curr_frame.img_grey, mask=None)
 
@@ -404,14 +413,17 @@ if __name__ == "__main__":
 
     cam = Camera(W, H, K, F)
     disp2d = Display2D(W, H)
+    disp3d = Display3D()
     slam = SLAM(W, H, K)
 
     while cap.isOpened():
         ret, img = cap.read()
-        img = cv.resize(img, (W, H))
 
         if ret == True:
+            img = cv.resize(img, (W, H))
             slam.process_frame(img)
         else:
             break
 
+        print(len(slam.frames))
+        disp3d.paint(slam.frames) 
