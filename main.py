@@ -71,17 +71,70 @@ class FeatureMatcher(object):
         # Using BruteForceMatcher with Hamming and No crosscheck
         self.matcher = cv.BFMatcher(cv.NORM_HAMMING, False) 
 
+
+    def compute_kps_des_pts(self, img):
+        orb = cv.ORB_create()
+        # bf = cv.BFMatcher(cv.NORM_HAMMING)
+
+        # detection
+        # turn img into 2D B/W and find features
+        feats = cv.goodFeaturesToTrack(np.mean(img, axis=2).astype(np.uint8), 500, qualityLevel=0.01, minDistance=3)
+
+        # from feats extract keypoints
+        kps = [cv.KeyPoint(x=f[0][0], y=f[0][1], _size=20) for f in feats]
+        kps, des = orb.compute(img, kps)
+
+        # from keypoint objects extract (floating point) pts 
+        pts = np.array([(kp.pt[0], kp.pt[1]) for kp in kps])
+
+        # kps = orb.detect(img, None)
+        # pts = np.array([x.pt for x in kps], dtype=np.float32)
+        return kps, des, pts
+
+    def match_frames(self, last_frame, curr_frame): 
+        bf = cv.BFMatcher(cv.NORM_HAMMING)
+        matches = bf.knnMatch(curr_frame.des, last_frame.des, k=2)
+        return matches
+
+    def filter_matches(self, last_frame, curr_frame):
+        ret = []
+        idx1, idx2 = [], []
+
+        for m,n in curr_frame.matches: 
+            if m.distance < 0.75 * n.distance:
+                idx1.append(m.queryIdx)
+                idx2.append(m.trainIdx)
+
+                curr_point = curr_frame.pts[m.queryIdx]
+                last_point = last_frame.pts[m.trainIdx]
+                ret.append((last_point,curr_point))
+
+        assert len(ret) >= 8
+        ret = np.array(ret)
+        idx2, idx1 = np.array(idx2), np.array(idx1)
+
+        # normalize coords ???????????????
+        ret[:, 0, :] = normalize(Kinv, ret[:, 0, :])
+        ret[:, 1, :] = normalize(Kinv, ret[:, 1, :])
+
+        # fit matrix ????????????????
+        model, inliers = ransac((ret[:, 0], ret[:, 1]), 
+                                # FundamentalMatrixTransform,
+                                EssentialMatrixTransform, 
+                                min_samples=8, 
+                                residual_threshold=0.005, 
+                                max_trials=200)
+
+        # ignore outliers ????????????????
+        Rt = extractRt(model.params)
+
+        return idx1[inliers], idx2[inliers], Rt
+
     def match_des(self, des1, des2): 
         self.matches = self.matcher.knnMatch(des1, des2, k=2)
         self.good_matches = self.getGoodMatches(self.matches, des1, des2)
         return self.good_matches
 
-    def match_des_simple(self, des1, des2): 
-        self.matches = self.matcher.knnMatch(des2, des1, k=2)
-        for m,n in matches: 
-            if m.distance < 0.75 * n.distance:
-                kp1 = kps[m.queryIdx].pt
-                kp2 = k
     # input: des1 are query discriptors, des2 are train descriptors 
     # output: idx1, idx2 are vectors of indcies for the good matches in des1, des2
     # the func checks to ensure that each trainIdx has exactly one queryIdx
@@ -120,13 +173,21 @@ class FeatureMatcher(object):
         # to detect the features 
         feats = cv.goodFeaturesToTrack(np.mean(img, axis=2).astype(np.uint8), 500, qualityLevel=0.01, minDistance=3)
 
-
         # extract feats into keypoints
         kps = [cv.KeyPoint(x=f[0][0], y=f[0][1], _size=20) for f in feats]
         kps, des = orb.compute(img, kps)
 
         return kps, des
 
+    def estimatePose(self, last_frame, curr_frame):
+        # undistort, unproject points?  
+        kRansacThresholdNormalized = 0.0003
+        kRansacProb = 0.999
+
+        E, self.mask_match = cv.findEssentialMat(curr_frame.kps, last_frame.kps, focal=1, pp=(0., 0.), 
+                                                mothod=cv.RANSAC, prob=kRansacProb, threshold=kRansacThresholdNormalized)
+        _, R, t, mask = cv.recoverPose(E, curr_frame.kpn, last_frame.kpn, focal=1, pp=(0., 0.))
+        return R, t
 
 class Frame(object):
     def __init__(self, img):
@@ -134,11 +195,27 @@ class Frame(object):
         slam.frames.append(self)
         self.img_grey = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
         self.id = len(slam.frames) 
-        print('new frame w/ id:', self.id)
+        IRt = np.eye(4)
+        self.pose = IRt
+        # print('new frame w/ id:', self.id)
+
+class Point(object): 
+    # Each point object represents a 3D point in the world
+    # each point should be observed in multiple frames 
+
+    def __init__(self, location): 
+        self.location = location
+        # to keep track of each frame and frame index that the point appears in 
+        self.past = []
+
+    def add_observation(self, frame, index):
+        self.past.append((frame, index))
+
 
 class SLAM(object):
     def __init__(self, W, H, K):
         self.map = Map()
+        self.fm = FeatureMatcher()
         self.frames = []
         self.W, self.H, self.K = W, H, K
         
@@ -146,18 +223,36 @@ class SLAM(object):
         self.curr_frame, self.last_frame = None, None
         self.feature_matcher = FeatureMatcher()
 
+    def triangulate(self, pose1, pose2, pts1, pts2):
+      ret = np.zeros((pts1.shape[0], 4))
+      for i, p in enumerate(zip(pts1, pts2)):
+        A = np.zeros((4,4))
+        A[0] = p[0][0] * pose1[2] - pose1[0]
+        A[1] = p[0][1] * pose1[2] - pose1[1]
+        A[2] = p[1][0] * pose2[2] - pose2[0]
+        A[3] = p[1][1] * pose2[2] - pose2[1]
+        _, _, vt = np.linalg.svd(A)
+        ret[i] = vt[3]
+      return ret
+
     def process_frame(self, img):
         # -----------------------------------------
         # Step 1: Capture new frame as a Frame object
         if self.FIRST_IMAGE == True: 
             # Only the first frame exists
             self.curr_frame = Frame(img)
+            curr_frame = self.curr_frame
             self.last_frame = None
-
             # Process the only frame
-            self.curr_frame.kps, self.curr_frame.des, self.curr_frame.pts = self.compute_kps_des_pts(self.curr_frame.img_rgb)
+            # Get keypoints and features 
+            kps, des, pts = self.fm.compute_kps_des_pts(self.curr_frame.img_rgb)
+            pts = normalize(Kinv, pts)
+            curr_frame.kps, curr_frame.des, curr_frame.pts = kps, des, pts
+
+            # Not Needed: self.curr_frame.kps, self.curr_frame.des, self.curr_frame.pts = self.compute_kps_des_pts(self.curr_frame.img_rgb)
+
             # self.process_first_frame(self.curr_frame)
-            disp2d.paint(img)
+            self.annotate_frame(None, self.curr_frame)
     
             # next frames will not be first
             self.FIRST_IMAGE = False 
@@ -170,117 +265,75 @@ class SLAM(object):
         self.curr_frame = Frame(img)
         self.last_frame = self.frames[-2]
 
+        curr_frame = self.curr_frame
+        last_frame = self.last_frame
+
         # Get keypoints and features 
-        self.curr_frame.kps, self.curr_frame.des, self.curr_frame.pts = self.compute_kps_des_pts(self.curr_frame.img_rgb)
+        kps, des, pts = self.fm.compute_kps_des_pts(self.curr_frame.img_rgb)
+        curr_frame.kps, curr_frame.des, curr_frame.pts = kps, des, pts
 
         # Match keypoints of current and last frames
-        self.curr_frame.matches = self.match_frames(self.last_frame, self.curr_frame)
+        curr_frame.matches = self.fm.match_frames(last_frame, curr_frame)
 
         # Filter the match results
-        idx1, idx2, Rt = self.filter_matches(self.curr_frame, self.last_frame)
-
+        # estiamte the essential matrix
+        # TODO? Make idx1, idx2, Rt an antribute of each Frame? 
+        idx1, idx2, Rt = self.fm.filter_matches(last_frame, curr_frame)
+        # print(Rt)
+        curr_frame.pose = np.dot(Rt, last_frame.pose)
+        # print(last_frame.pose)
+        # print(curr_frame.pose)
+        # print(len(last_frame.pts[idx2]))
+        # print(len(curr_frame.pts[idx1]))
+        pts4d = self.triangulate(last_frame.pose, curr_frame.pose, last_frame.pts[idx2], curr_frame.pts[idx1])
         # annotate the frame with filtered match results 
-        # self.annotate_frame(self.curr_frame)
-        annotated_img = self.curr_frame.img_rgb.copy()
-        print('\n')
-        for pt1, pt2 in zip(self.curr_frame.pts[idx1], self.last_frame.pts[idx2]):
-            # u1, v1 = normalize(Kinv, pt1)
-            # u2, v2 = normalize(Kinv, pt2)
-            u1, v1 = int(round(pt1[0])), int(round(pt1[1]))
-            u2, v2 = int(round(pt2[0])), int(round(pt2[1]))
-            cv.circle(annotated_img, (u1,v1), color=(0, 255, 0), radius=5)
-            cv.line(annotated_img, (u1,v1), (u2, v2), (0, 255, 255), 3)
-
-        print('num pts: ', len(pt1))
-        disp2d.paint(annotated_img)
+        self.annotate_frame(last_frame, curr_frame, idx1, idx2)
+        
+            
         # OLD: self.curr_frame.process_next_frame(self.last_frame, self.curr_frame)
 
-        
-    def compute_kps_des_pts(self, img):
-        orb = cv.ORB_create()
-        # bf = cv.BFMatcher(cv.NORM_HAMMING)
+    def annotate_frame(self, last_frame, curr_frame, idx1=None, idx2=None):
+        annotated_img = self.curr_frame.img_rgb.copy()
 
-        # detection
-        # turn img into 2D B/W and find features
-        feats = cv.goodFeaturesToTrack(np.mean(img, axis=2).astype(np.uint8), 500, qualityLevel=0.01, minDistance=3)
+        if last_frame == None:
+            annotated_img = cv.drawKeypoints(annotated_img, curr_frame.kps, annotated_img)
+            disp2d.paint(annotated_img)
+            return
 
-        # from feats extract keypoints
-        kps = [cv.KeyPoint(x=f[0][0], y=f[0][1], _size=20) for f in feats]
-        kps, des = orb.compute(img, kps)
-
-        # from keypoint objects extract (floating point) pts 
-        pts = np.array([(kp.pt[0], kp.pt[1]) for kp in kps])
-
-        # kps = orb.detect(img, None)
-        # pts = np.array([x.pt for x in kps], dtype=np.float32)
-        return kps, des, pts
-
-    def match_frames(self, last_frame, curr_frame): 
-        bf = cv.BFMatcher(cv.NORM_HAMMING)
-        matches = bf.knnMatch(curr_frame.des, last_frame.des, k=2)
-        return matches
-
-    def filter_matches(self, curr_frame, last_frame):
-        ret = []
-        idx1, idx2 = [], []
-
-        for m,n in curr_frame.matches: 
-            if m.distance < 0.75 * n.distance:
-                idx1.append(m.queryIdx)
-                idx2.append(m.trainIdx)
-
-                curr_point = curr_frame.pts[m.queryIdx]
-                last_point = last_frame.pts[m.trainIdx]
-                ret.append((curr_point, last_point))
-
-        assert len(ret) >= 8
-        ret = np.array(ret)
-        idx1, idx2 = np.array(idx1), np.array(idx2)
-
-        # normalize coords ???????????????
-        ret[:, 0, :] = normalize(Kinv, ret[:, 0, :])
-        ret[:, 1, :] = normalize(Kinv, ret[:, 1, :])
-
-
-        # fit matrix ????????????????
-        # print(ret[:, 0], ret[:, 1])
-        # print(ret[:, 0].shape, ret[:, 1].shape)
-        model, inliers = ransac((ret[:, 0], ret[:, 1]), 
-                                FundamentalMatrixTransform,
-                                # EssentialMatrixTransform, 
-                                min_samples=8, 
-                                residual_threshold=0.005, 
-                                max_trials=200)
-
-        # ignore outliers ????????????????
-        Rt = extractRt(model.params)
-
-        return idx1[inliers], idx2[inliers], Rt
-
-    
-    def process_first_frame(self, curr_frame): 
-        curr_frame.kps, curr_frame.des = orb.detectAndCompute(curr_frame.img_grey, mask=None)
-
-        # self.kps is a list of keypoint objects, we want the numberical (float) values
-        # so we convert list of keypoints to array of points
-        curr_frame.kps = np.array([x.pt for x in curr_frame.kps], dtype=np.float32)
-        
-        # paint the keypoints and display the result
-        self.drawFeatures(None, curr_frame)
-
-
-    def drawFeatures(self, last_frame, curr_frame): 
-        annotated_img = curr_frame.img_rgb.copy()
-
-        if slam.FIRST_IMAGE == True: 
-            for point in curr_frame.kps:
-                a,b = point.ravel()
-                cv.circle(annotated_img, (int(a), int(b)), 5, (0,255,0), -1)
-
-        else: 
-            # TODO: implement draw features on next frames
-            pass
+        for pt2, pt1 in zip(last_frame.pts[idx2], curr_frame.pts[idx1]):
+            #u1, v1 = denormalize(self.K, pt1)
+            #u2, v2 = denormalize(self.K, pt2)
+            u1, v1 = int(round(pt1[0])), int(round(pt1[1]))
+            u2, v2 = int(round(pt2[0])), int(round(pt2[1]))
+            # print(u1,v1)
+            cv.circle(annotated_img, (u1,v1), color=(0, 255, 0), radius=3)
+            cv.line(annotated_img, (u1,v1), (u2, v2), (0, 255, 255), 1)
+        # print('num pts: ', len(curr_frame.pts))
         disp2d.paint(annotated_img)
+    
+    # def process_first_frame(self, curr_frame): 
+    #     curr_frame.kps, curr_frame.des = orb.detectAndCompute(curr_frame.img_grey, mask=None)
+
+    #     # self.kps is a list of keypoint objects, we want the numberical (float) values
+    #     # so we convert list of keypoints to array of points
+    #     curr_frame.kps = np.array([x.pt for x in curr_frame.kps], dtype=np.float32)
+    #     
+    #     # paint the keypoints and display the result
+    #     self.drawFeatures(None, curr_frame)
+
+
+    # def drawFeatures(self, last_frame, curr_frame): 
+    #     annotated_img = curr_frame.img_rgb.copy()
+
+    #     if slam.FIRST_IMAGE == True: 
+    #         for point in curr_frame.kps:
+    #             a,b = point.ravel()
+    #             cv.circle(annotated_img, (int(a), int(b)), 5, (0,255,0), -1)
+
+    #     else: 
+    #         # TODO: implement draw features on next frames
+    #         pass
+    #     disp2d.paint(annotated_img)
 
 
         
@@ -325,11 +378,6 @@ class SLAM(object):
     #     # estimate pose 
     #     #R, t = self.estimatePose(last_frame, curr_frame)
     #     self.drawFeatures(last_frame, curr_frame) 
-
-
-
-
-        
 
 
 

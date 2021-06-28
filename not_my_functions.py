@@ -1,4 +1,5 @@
 import numpy as np
+
 # turn [[x,y]] -> [[x,y,1]]
 def add_ones(x):
   return np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
@@ -13,8 +14,10 @@ def extractRt(E):
   if np.sum(R.diagonal()) < 0:
     R = np.dot(np.dot(U, W.T), Vt)
   t = U[:, 2]
-  Rt = np.concatenate([R,t.reshape(3,1)], axis=1)
-  return Rt
+  ret = np.eye(4)
+  ret[:3, :3] = R
+  ret[:3, 3] = t
+  return ret
 
 def normalize(Kinv, pts):
   return np.dot(Kinv, add_ones(pts).T).T[:, 0:2]
