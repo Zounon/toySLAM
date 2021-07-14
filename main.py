@@ -2,28 +2,111 @@
 import numpy as np
 import os
 import cv2 as cv
+
+import g2o
+from multiprocessing import Process, Queue
+
 from collections import defaultdict
 from skimage.measure import ransac
 from skimage.transform import EssentialMatrixTransform, FundamentalMatrixTransform
 from display import Display2D, Display3D
 from matplotlib import pyplot as plt
+from not_my_functions import extractRt, add_ones, normalize, denormalize, fundamentalToRt, poseRt
 
-from not_my_functions import extractRt, add_ones, normalize, denormalize, fundamentalToRt
+'''
+TODO next time
 
+cant triangulate points
+I think pose estimation is the problem,
+might need to implement g2o optimizer to get decent pose
+'''
 orb = cv.ORB_create()
-class Map(object):
-    def __init__(self):
-        self.frames = []
-        self.last_frame = None
 
-    def add_frame(frame_obj):
-        self.frames.append(frame_obj)
-        self.last_frame = frames[-1]
+import numpy
+import g2o
 
+def g2oOptimizer(frames, points, local_window, fix_points, verbose=False, round=50):
+    if local_window is None: 
+        local_frames = frames
+    else:
+        local_frames = frames[-local_window:]
 
-class Map(object):
-    def __init__(self) -> None:
-        self.frames = []
+    # create g2o optimizer
+    opt = g2o.SparseOptimizer()
+    solver = g2o.BlockSolverSE3(g2o.LinearSolverCholmodSE3())
+    solver = g2o.OptimizationAlgorithmLevenberg(solver)
+    opt.set_algorithm(solver)
+
+    # add normalized camera
+    cam = g2o.CameraParameters(1.0, (0.0, 0.0), 0)
+    cam.set_id(0)
+    opt.add_parameter(cam)
+
+    robust_kernel = g2o.RobustKernelHuber(np.sqrt(5.991))
+    graph_frames, graph_points = dict(), dict()
+
+    # add frames to graph
+    for frame in (local_frames if fix_points else frames): 
+        pose = frame.pose
+        se3 = g2o.SE3Quat(pose[0:3, 0:3], pose[0:3, 3])
+        v_se3 = g2o.VertexSE3Expmap()
+        v_se3.set_estimate(se3)
+
+        v_se3.set_id(frame.id * 2)
+        v_se3.set_fixed(frame.id <= 1 or frame not in local_frames)
+        opt.add_vertex(v_se3)
+
+        # confirm pose correctness
+        est = v_se3.estimate()
+        assert np.allclose(pose[0:3, 0:3], est.rotation().matrix())
+        assert np.allclose(pose[0:3, 3], est.translation())
+
+        graph_frames[frame] = v_se3
+
+    # add points to frames
+    for point in slam.points: 
+        # check that new point is not already a part of the frame
+        if not any([f in local_frames for f in point.frames]):
+            continue
+
+        graph_point = g20.VertexSBAPointXYZ()
+        graph_point.set_id(point.id  * 2 + 1)
+        graph_point.set_estimate(point.pt[0:3])
+        graph_point.set_marginalized(True)
+        graph_point.set_fixed(fix_points)
+        opt.add_vertex(graph_point)
+        graph_points[point] = graph_point
+
+        # add edges
+        for frame, idx in zip(point.frames, point.idxs):
+            if frame not in graph_frames:
+                continue
+            edge = g2o.EdgeProjectP2MC()
+            edge.set_vertex(0, 0)
+            edge.set_vertex(1, graph_frames[frame]) 
+            edge.set_measurement(frame.points[idx])
+            edge.set_information(np.eye(2))
+            edge.set_robust_kernel(robust_kernel)
+            opt.add_edge(edge)
+        
+    if verbose:
+        opt.set_verbose(True)
+    opt.initialize_optimization()
+    opt.optimize(30)
+
+    # put frames back
+    for gf in graph_frames: 
+        est = graph_frames[gf].estimate()
+        R = est.rotation().matrix()
+        t = est.translation()
+        gf.pose = poseRt(R,t)
+
+    # put points back
+    if not fix_points:
+        for gp in graph_points:
+            gp.pt = np.array(graph_points[gp].estimate())
+
+    return opt.active_chi2()
 
 
 class Camera(object):
@@ -141,7 +224,7 @@ class FeatureMatcher(object):
     def getGoodMatches(self, matches, des1, des2): 
         len_des2 = len(des2)
         idx1, idx2 = [], []
-        ratio = 0.7
+        ratio = 0.75
 
         if matches is not None: 
             float_inf = float('inf')
@@ -194,22 +277,84 @@ class Frame(object):
         self.img_rgb = img
         slam.frames.append(self)
         self.img_grey = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-        self.id = len(slam.frames) 
+        # self.id = len(slam.frames) 
+        self.id = slam.add_frame(self)
         IRt = np.eye(4)
         self.pose = np.array(IRt)
         # print('new frame w/ id:', self.id)
+
+class Map(object):
+    def __init__(self):
+        self.frames = []
+        self.last_frame = None
+
+    def add_frame(frame_obj):
+        self.frames.append(frame_obj)
+        self.last_frame = frames[-1]
+
+    # def optimize(self):
+    #     optimizer = g2o.SparseOptimizer()
+    #     solver = g2o.BlockSolverSE3(g2o.LinearSolverCholmodSE3())
+    #     solver = g2o.OptimizationAlgorithmLevenberg(solver)
+    #     optimizer.set_algorithm(solver)
+
+    #     # super().initialize_optimization()
+    #     # super().optimize(max_iterations)
+    # 
+    #     # ????
+    #     robust_kernel = g2o.RobustKernelHuber(np.sqrt(5.991))
+
+    #     # add frames to graph
+    #     for frame in self.frames: 
+    #         sbacam = g2o.SBACam(g2o.SE3Quat(frame.pose[0:3, 0:3], frame.pose[0:3, 3]))
+    #         sbacam.set_cam(frame.K[0][0],frame.K[1][1],frame.K[2][0],frame.K[2][1], 1.0)
+
+    #         v_se3 = g2o.VertexSE3()
+    #         v_se3.set_id(frame.id)
+    #         v_se3.set_estimate(sbacam)
+    #         v_se3.set_fixed(frame.id == 0)
+    #         opt.add_vertex(v_se3)
+    # 
+    #     # add points to frames
+    #     for point in self.points: 
+    #         graph_point = g20.VertexSBAPointXYZ()
+    #         graph_point.set_id(point.id + 0x100000)
+    #         graph_point.set_estimate(point.pt[0:3])
+    #         graph_point.set_marginalized(True)
+    #         graph_point.set_fixed(False)
+    #         opt.add_vertex(graph_point)
+    #         for frame in point.frames:
+    #               for f in p.frames:
+    #         edge = g2o.EdgeProjectP2MC()
+    #         edge.set_vertex(0, pt)
+    #         edge.set_vertex(1, opt.vertex(f.id))
+    #         uv = f.kps[f.pts.index(p)]
+    #         edge.set_measurement(uv)
+    #         edge.set_information(np.eye(2))
+    #         edge.set_robust_kernel(robust_kernel)
+    #         opt.add_edge(edge)
+    #         
+    #     opt.set_verbose(True)
+    #     opt.initialize_optimization()
+    #     opt.optimize(20)
 
 class Point(object): 
     # Each point object represents a 3D point in the world
     # each point should be observed in multiple frames 
 
-    def __init__(self, location): 
+    def __init__(self, location, color): 
         self.location = location
+        self.color = color
         # to keep track of each frame and frame index that the point appears in 
-        self.past = []
+        self.keyframe_observation = dict() 
+        self.frames = []
+        self.idxs = []
+        self.id = slam.add_point(self)
 
     def add_observation(self, frame, index):
-        self.past.append((frame, index))
+        # self.past.append((frame, index))
+        self.frames.append(frame) 
+        self.idxs.append(index)
 
 
 class SLAM(object):
@@ -217,12 +362,27 @@ class SLAM(object):
         self.map = Map()
         self.fm = FeatureMatcher()
         self.frames = []
+        self.points = []
+        self.max_point = 0
+        self.max_frame = 0
         self.W, self.H, self.K = W, H, K
         
         self.FIRST_IMAGE = True
         self.curr_frame, self.last_frame = None, None
         self.feature_matcher = FeatureMatcher()
 
+    def add_frame(self, frame): 
+        i = self.max_frame
+        self.max_frame += 1
+        self.frames.append(frame)
+        return i
+
+    def add_point(self, point): 
+        i = self.max_point
+        self.max_point += 1
+        self.points.append(point)
+        return i
+    
     def triangulate(self, pose1, pose2, pts1, pts2):
       ret = np.zeros((pts1.shape[0], 4))
       for i, p in enumerate(zip(pts1, pts2)):
@@ -271,6 +431,7 @@ class SLAM(object):
         # Get keypoints and features 
         kps, des, pts = self.fm.compute_kps_des_pts(self.curr_frame.img_rgb)
         curr_frame.kps, curr_frame.des, curr_frame.pts = kps, des, pts
+        curr_frame.pts_array = [None] * len(curr_frame.pts)
 
         # Match keypoints of current and last frames
         curr_frame.matches = self.fm.match_frames(last_frame, curr_frame)
@@ -279,8 +440,11 @@ class SLAM(object):
         # estiamte the essential matrix
         # TODO? Make idx1, idx2, Rt an antribute of each Frame? 
         idx1, idx2, Rt = self.fm.filter_matches(last_frame, curr_frame)
+        curr_frame.idx1, curr_frame.idx2, curr_frame.Rt = idx1, idx2, Rt
         # print(Rt)
 
+        pose_opt = g2oOptimizer(slam.frames, slam.points, local_window=1, fix_points=True)
+        print(pose_opt)
         curr_frame.pose = np.dot(Rt, last_frame.pose)
 
         # print(last_frame.pose)
@@ -288,12 +452,70 @@ class SLAM(object):
         # print(len(last_frame.pts[idx2]))
         # print(len(curr_frame.pts[idx1]))
 
-        # pts4d = self.triangulate(last_frame.pose, curr_frame.pose, last_frame.pts[idx2], curr_frame.pts[idx1])
+        # might need to swap last and curr frame position
+        pts4d = self.triangulate(last_frame.pose, curr_frame.pose, curr_frame.pts[idx1], last_frame.pts[idx2])
+        print('\n')
+        print('len pts4d', len(pts4d))
+        good_pts4d = np.array([curr_frame.pts_array[i] is None for i in idx1])
+        good_pts4d &= np.abs(pts4d[:, 3]) != 0
+        pts4d /= pts4d[:, 3:] # make the pts homogenous 
+        
+        new_pts_count = 0
+        b1 = 0
+        b2 = 0
+        b3 = 0
+        b4 = 0
+        for i,point in enumerate(pts4d):
+            if not good_pts4d[i]:
+                b1+=1
+                continue
+
+            # check that points are infront of both cameras
+            # is this measuring paralax? 
+            curr_paralax = np.dot(curr_frame.pose, point)
+            last_paralax = np.dot(last_frame.pose, point)
+            print('\n')
+            print(curr_frame.pose)
+            print(last_frame.pose)
+            print('\n')
+            print(curr_paralax) 
+            print(last_paralax)
+            print('\n')
+            if curr_paralax[2] < 0 or last_paralax[2] < 0:
+                b2+=1
+                continue
+
+            # reproject 
+            new_curr_point = np.dot(self.K, curr_paralax[:3])
+            new_last_point = np.dot(self.K, last_paralax[:3])
+
+            # check reprojection error
+           #  cp_error = (new_curr_point[0:2] / new_curr_point[2]) - curr_frame.pts[curr_frame.idx1[i]]
+           #  lp_error = (new_last_point[0:2] / new_last_point[2]) - last_frame.pts[last_frame.idx1[i]]
+           #  cp_error = np.sum(cp_error ** 2)
+           #  lp_error = np.sum(lp_error ** 2)
+           #  if cp_error > 2 or lp_error > 2: 
+           #      b3+=1
+           #      continue 
+
+            # add the point
+            try: 
+                color = curr_frame.rgb_img[int(round(curr_frame.pts[idx1[i], 1])), int(round(curr_frame.pts[idx1[i], 0]))] 
+            except:
+                b4+=1
+                color = (255, 0, 0)
+
+            pt = Point(point[0:3], color)
+            pt.add_observation(curr_frame, idx1[i])
+            pt.add_observation(last_frame, idx2[i])
+            new_pts_count += 1
+
+        print('added %d new points' % (new_pts_count))
+        print('break poitns', b1, b2, b3, b4)
 
         # annotate the frame with filtered match results 
         curr_frame.img = self.annotate_frame(last_frame, curr_frame, idx1, idx2)
-           
-            
+
         # OLD: self.curr_frame.process_next_frame(self.last_frame, self.curr_frame)
 
     def annotate_frame(self, last_frame, curr_frame, idx1=None, idx2=None):
